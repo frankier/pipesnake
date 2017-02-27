@@ -18,16 +18,20 @@ def sink_unsinked_to_devnull(root):
     sink_unsinked(root, DEVNULL_SINK)
 
 
-def sink_unsinked_to_stdio(root: Stage, name=None):
-    sink_unsinked(root, STDOUT_SINK, only_source_name='stdout')
+def sink_stderr(root: Stage):
     sink_unsinked(root, STDERR_SINK, only_source_name='stderr')
+
+
+def sink_unsinked_to_stdio(root: Stage):
+    sink_stderr(root)
+    sink_unsinked(root, STDOUT_SINK, only_source_name='stdout')
 
 
 def sink_unsinked_stderr_to_stdout(root):
     sink_unsinked(root, MERGE_SINK, only_source_name='stderr')
 
 
-def source_unsourced_from_stdio(root, name=None):
+def source_unsourced_from_stdio(root):
     source_unsourced(root, STDIN_SOURCE, only_sink_name='stdin')
 
 
@@ -43,12 +47,20 @@ def connect_default(root):
 
 
 # File implementations
-class SourceSuppliesFileNet(Net):
+class SourceSuppliesFileIntNet(Net):
     goodness = 10
 
 
-class SinkSuppliesFileNet(Net):
+class SinkSuppliesFileIntNet(Net):
     goodness = 10
+
+
+class SourceSuppliesFileLikeNet(Net):
+    goodness = 5
+
+
+class SinkSuppliesFileLikeNet(Net):
+    goodness = 5
 
 
 # Pipe implementations
@@ -77,7 +89,7 @@ class OSPipeNet(Net):
         readable, writable = self.pipe
         return fcntl.fcntl(writable, F_SETPIPE_SZ, value)
 
-    def on_source_start(self):
+    def close_writable(self):
         readable, writable = self.pipe
         os.close(writable)
 
@@ -145,11 +157,11 @@ class SinkConnector(Connector):
 
 
 class SubprocessSourceConnector(SourceConnector):
-    supported_nets = (OSPipeNet, SinkSuppliesFileNet)
+    supported_nets = (OSPipeNet, SinkSuppliesFileIntNet)
 
 
 class SubprocessSinkConnector(SinkConnector):
-    supported_nets = (OSPipeNet, SourceSuppliesFileNet)
+    supported_nets = (OSPipeNet, SourceSuppliesFileIntNet)
 
 
 class SubprocessArgumentSourceConnector(SourceConnector):
@@ -161,15 +173,33 @@ class SubprocessArgumentSinkConnector(SinkConnector):
 
 
 class FileSourceConnector(SourceConnector):
-    supported_nets = (SourceSuppliesFileNet,)
+    supported_nets = (SourceSuppliesFileIntNet, SourceSuppliesFileLikeNet)
 
 
 class FileSinkConnector(SinkConnector):
-    supported_nets = (SinkSuppliesFileNet,)
+    supported_nets = (SinkSuppliesFileIntNet, SinkSuppliesFileLikeNet)
+
+
+class PortStage(Stage):
+    # XXX: This should all live in connector, yeah?
+    def __init__(self):
+        self.source_ports = {}
+        self.sink_ports = {}
+        super().__init__()
+
+    @property
+    def all_ports(self):
+        return {**self.source_ports, **self.sink_ports}
+
+    def connect_source(self, port, payload):
+        self.source_ports[port] = payload
+
+    def connect_sink(self, port, payload):
+        self.sink_ports[port] = payload
 
 
 # Subprocess stages implementations
-class SubprocessStage(Stage):
+class SubprocessStage(PortStage):
     sinks_avail = ('stdin',)
     sources_avail = ('stdout', 'stderr')
     _default_source = 'stdout'
@@ -183,77 +213,107 @@ class SubprocessStage(Stage):
 
     def __init__(self, *args):
         self.args = args
-        self.kwargs = {}
         self.running = False
-        self.subprocess = None
+        self.proc = None
         super().__init__()
 
     @property
     def is_running(self):
         return self.running
 
-    def run(self):
-        # XXX: Poorly named? - Doesn't actually run until awaited?
+    async def run(self):
         self.running = True
-        self.subprocess = self.create_fn(*self.args, **self.kwargs)
+
+        self.proc = await self.create_fn(*self.args, **self.all_ports)
+        for source_name, source_net in self.sources.items():
+            if hasattr(source_net, 'close_writable'):
+                source_net.close_writable()
 
     async def create_and_wait(self):
-        proc = await self.subprocess
-        for net in self.sources.values():
-            net.on_source_start()
-        await proc.wait()
+        if self.proc is None:
+            raise  # Can't get coroutine before I've been run!
+        await self.proc.wait()
+        #for source_name, source_port in self.source_ports.items():
+            #source_port.close()
 
     def get_coroutine(self):
-        if self.subprocess is None:
-            raise  # Can't get coroutine before I've been run!
         return self.create_and_wait()
-
-    # For use by connectors only
-    def connect(self, port, payload):
-        self.kwargs[port] = payload
 
     def __repr__(self):
         from reprlib import repr
-        return '{}({}, {})'.format(
+        return '{}({}{}{})'.format(
             type(self).__name__,
             ", ".join(repr(v) for v in self.args),
+            ", " if self.args and self.all_ports else "",
             ", ".join("{}={}".format(k, repr(v))
-                      for k, v in self.kwargs.items()))
+                      for k, v in self.all_ports.items()))
 
 
 class ShellStage(SubprocessStage):
     create_fn = staticmethod(create_subprocess_shell)
 
+    def short_repr(self):
+        return self.args[0]
+
 
 class ExecStage(SubprocessStage):
     create_fn = staticmethod(create_subprocess_exec)
+
+    def short_repr(self):
+        return ' '.join(self.args)
 
 
 # File stages
 class FileSourceStageBase(Stage):
     sources_avail = ('read',)
-    source_connectors = {
-        'read': FileSourceConnector('read'),
-    }
+
+    def short_repr(self):
+        return str(self.fp)
 
 
 class FileSinkStageBase(Stage):
     sinks_avail = ('write',)
+
+    def short_repr(self):
+        # XXX: Not dry - should use file name/path when available
+        return str(self.fp)
+
+
+def readable_fp_to_fl(fp):
+    return open(fp, 'r', closefd=False)
+
+
+def writable_fp_to_fl(fp):
+    return open(fp, 'w')
+    #, closefd=False)
+
+
+class FileSourceStage(FileSourceStageBase):
+    source_connectors = {
+        'read': FileSourceConnector('read'),
+    }
+
+    def __init__(self, fp):
+        self.fp = fp
+        super().__init__()
+
+    @property
+    def fl(self):
+        return readable_fp_to_fl(self.fp)
+
+
+class FileSinkStage(FileSinkStageBase):
     sink_connectors = {
         'write': FileSinkConnector('write'),
     }
 
-
-class FileSourceStage(FileSourceStageBase):
     def __init__(self, fp):
         self.fp = fp
         super().__init__()
 
-
-class FileSinkStage(FileSinkStageBase):
-    def __init__(self, fp):
-        self.fp = fp
-        super().__init__()
+    @property
+    def fl(self):
+        return writable_fp_to_fl(self.fp)
 
 
 # Special stages
@@ -291,40 +351,58 @@ dispatch = partial(dispatch, namespace=dispatch_namespace)
 
 
 # Connect multiple dispatch functions
-@dispatch(FileSourceConnector, SourceSuppliesFileNet, object)
+@dispatch(FileSourceConnector, SourceSuppliesFileIntNet, object)
 def connect_source(source_connector, net, source):
     net.fp = source.fp
 
 
-@dispatch(SubprocessSourceConnector, SinkSuppliesFileNet, object)
+@dispatch(FileSourceConnector, SourceSuppliesFileLikeNet, object)
+def connect_source(source_connector, net, source):
+    net.fl = source.fl
+
+
+@dispatch(SubprocessSourceConnector, SinkSuppliesFileIntNet, object)
 def connect_source(source_connector, net, source):
     # Make sure net.fp is available
     net.ensure_sinks_connected()
-    source.connect(source_connector.name, net.fp)
+    source.connect_source(source_connector.name, net.fp)
 
 
 @dispatch(SubprocessSourceConnector, OSPipeNet, object)
 def connect_source(source_connector, net, source):
     net.ensure_connectable()
     readable, writable = net.pipe
-    source.connect(source_connector.name, writable)
-    #os.close(writable)
+    source.connect_source(source_connector.name, writable)
+    #source.close_writable()
+    #net.close_writable()
 
 
-@dispatch(SubprocessSinkConnector, SourceSuppliesFileNet, object)
+@dispatch(SubprocessSinkConnector, SourceSuppliesFileIntNet, object)
 def connect_sink(sink_connector, net, sink):
     # Make sure net.fp is available
     net.ensure_source_connected()
-    sink.connect(sink_connector.name, net.fp)
+    sink.connect_sink(sink_connector.name, net.fp)
 
 
-@dispatch(FileSinkConnector, SinkSuppliesFileNet, object)
+@dispatch(SubprocessSinkConnector, SourceSuppliesFileIntNet, object)
+def connect_sink(sink_connector, net, sink):
+    # Make sure net.fp is available
+    net.ensure_source_connected()
+    sink.connect_sink(sink_connector.name, net.fl)
+
+
+@dispatch(FileSinkConnector, SinkSuppliesFileIntNet, object)
 def connect_sink(sink_connector, net, sink):
     net.fp = sink.fp
+
+
+@dispatch(FileSinkConnector, SinkSuppliesFileLikeNet, object)
+def connect_sink(sink_connector, net, sink):
+    net.fl = sink.fl
 
 
 @dispatch(SubprocessSinkConnector, OSPipeNet, object)
 def connect_sink(sink_connector, net, sink):
     net.ensure_connectable()
     readable, writable = net.pipe
-    sink.connect(sink_connector.name, readable)
+    sink.connect_sink(sink_connector.name, readable)

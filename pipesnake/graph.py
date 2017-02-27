@@ -3,6 +3,8 @@ from .exceptions import (
     NoDefaultSinkException)
 from collections import deque
 from operator import attrgetter
+import collections
+import itertools
 
 # This file contains abstract dataflow graph stuff in isolation from anything
 # to do with concrete sources and sinks or the actual string payloads that
@@ -37,6 +39,16 @@ class Net(object):
             sink_name = sink_stage.default_sink
         self.sinks.append((sink_stage, sink_name))
         sink_stage.sinks[sink_name] = self
+
+    def rm_sink(self, sink_name):
+        sink_stage = self.sinks[sink_name]
+        del self.sinks[sink_name]
+        sink_stage.sinks.remove((sink_stage, sink_name))
+
+    def detach(self):
+        self.rm_source()
+        for sink_name in self.sinks:
+            self.rm_sink(sink_name)
 
     def ensure_source_connected(self):
         from pipesnake.stages import connect_source
@@ -122,8 +134,8 @@ class Stage(object):
         attach(self, sink_stage, source_name, sink_name, net_cls, net)
         return sink_stage
 
-    def run(self):
-        pass
+    async def run(self):
+        return
 
     async def empty_coroutine(self):
         pass
@@ -146,10 +158,8 @@ def attach(source, sink, source_name=None, sink_name=None,
         if net_cls is None:
             # Get the preferred net class for these two types of connectors
             source_connector = source.source_connectors[source_name]
-            #print(sink, sink_name)
             sink_connector = sink.sink_connectors[sink_name]
             available_nets = []
-            #print(source_connector.supported_nets, sink_connector.supported_nets)
             for net in source_connector.supported_nets:
                 if net in sink_connector.supported_nets:
                     available_nets.append(net)
@@ -179,28 +189,54 @@ def check_root(root):
             "This operation takes the root of a pipeline.")
 
 
-def stage_iter(root):
-    queue = deque((root,))
-    seen = set()
-    while len(queue):
-        stage = queue.popleft()
-        yield stage
-        for net in stage.sources.values():
-            for next_stage, sink_name in net.sinks:
+def get_next_stages(stage):
+    for net in stage.sources.values():
+        for next_stage, sink_name in net.sinks:
+            yield next_stage
+
+
+def get_prev_stages(stage):
+    for net in stage.sinks.values():
+        prev_stage, source_name = net.source
+        yield prev_stage
+
+
+def get_connected_stages(stage):
+    return itertools.chain(get_next_stages(stage), get_prev_stages(stage))
+
+
+def _stage_iter(next_fn):
+    def inner(roots):
+        if not isinstance(roots, collections.Iterable):
+            for res in inner([roots]):
+                yield res
+            return
+        queue = deque(roots)
+        seen = set(roots)
+        while len(queue):
+            stage = queue.popleft()
+            yield stage
+            for next_stage in next_fn(stage):
                 if next_stage not in seen:
                     queue.append(next_stage)
                     seen.add(next_stage)
+    return inner
+
+
+stage_iter = _stage_iter(get_next_stages)
+stage_iter_backwards = _stage_iter(get_prev_stages)
+stage_iter_all = _stage_iter(get_connected_stages)
 
 
 def unsinked_iter(root):
-    for node in stage_iter(root):
+    for node in stage_iter_all(root):
         for source in node.sources_avail:
             if source not in node.sources:
                 yield (node, source)
 
 
 def unsourced_iter(root):
-    for node in stage_iter(root):
+    for node in stage_iter_all(root):
         for sink in node.sinks_avail:
             if sink not in node.sinks:
                 yield (node, sink)
@@ -228,3 +264,11 @@ def source_unsourced(root: Stage, source_node: Stage,
 
 def has_unsinked(root):
     return len(unsinked_iter(root)) > 0
+
+
+def get_roots(stage):
+    result = set()
+    for stage in stage_iter_all(stage):
+        if len(stage.sinks) == 0:
+            result.add(stage)
+    return result
