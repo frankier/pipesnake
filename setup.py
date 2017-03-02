@@ -7,7 +7,7 @@ setup(
     license='Apache v2',
     long_description=open('README.md').read(),
     install_requires=[
-        'multipledispatch',
+        'multipledispatch', 'curio',
     ],
     extras_require={
         'shdsl': ["sarge"],

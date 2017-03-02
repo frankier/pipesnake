@@ -7,7 +7,8 @@ import tempfile
 import threading
 from functools import partial
 
-from asyncio.subprocess import create_subprocess_exec, create_subprocess_shell
+from curio import subprocess
+from curio.io import FileStream
 from multipledispatch import dispatch
 
 from .graph import Net, Stage, sink_unsinked, source_unsourced
@@ -250,14 +251,18 @@ class SubprocessStage(PortStage):
 
 
 class ShellStage(SubprocessStage):
-    create_fn = staticmethod(create_subprocess_shell)
+    @staticmethod
+    async def create_fn(*args, **kwargs):
+        return subprocess.Popen(*args, shell=True, **kwargs)
 
     def short_repr(self):
         return self.args[0]
 
 
 class ExecStage(SubprocessStage):
-    create_fn = staticmethod(create_subprocess_exec)
+    @staticmethod
+    async def create_fn(*args, **kwargs):
+        return subprocess.Popen(args, **kwargs)
 
     def short_repr(self):
         return ' '.join(self.args)
@@ -288,6 +293,14 @@ def writable_fp_to_fl(fp):
     #, closefd=False)
 
 
+def areadable_fp_to_fl(fp):
+    return FileStream(open(fp, 'br', buffering=0, closefd=False))
+
+
+def awritable_fp_to_fl(fp):
+    return FileStream(open(fp, 'bw', buffering=0))
+
+
 class FileSourceStage(FileSourceStageBase):
     source_connectors = {
         'read': FileSourceConnector('read'),
@@ -300,6 +313,10 @@ class FileSourceStage(FileSourceStageBase):
     @property
     def fl(self):
         return readable_fp_to_fl(self.fp)
+
+    @property
+    def afl(self):
+        return areadable_fp_to_fl(self.fp)
 
 
 class FileSinkStage(FileSinkStageBase):
@@ -314,6 +331,10 @@ class FileSinkStage(FileSinkStageBase):
     @property
     def fl(self):
         return writable_fp_to_fl(self.fp)
+
+    @property
+    def afl(self):
+        return awritable_fp_to_fl(self.fp)
 
 
 # Special stages
@@ -352,24 +373,24 @@ dispatch = partial(dispatch, namespace=dispatch_namespace)
 
 # Connect multiple dispatch functions
 @dispatch(FileSourceConnector, SourceSuppliesFileIntNet, object)
-def connect_source(source_connector, net, source):
+async def connect_source(source_connector, net, source):
     net.fp = source.fp
 
 
 @dispatch(FileSourceConnector, SourceSuppliesFileLikeNet, object)
-def connect_source(source_connector, net, source):
-    net.fl = source.fl
+async def connect_source(source_connector, net, source):
+    net.afl = source.afl
 
 
 @dispatch(SubprocessSourceConnector, SinkSuppliesFileIntNet, object)
-def connect_source(source_connector, net, source):
+async def connect_source(source_connector, net, source):
     # Make sure net.fp is available
-    net.ensure_sinks_connected()
+    await net.ensure_sinks_connected()
     source.connect_source(source_connector.name, net.fp)
 
 
 @dispatch(SubprocessSourceConnector, OSPipeNet, object)
-def connect_source(source_connector, net, source):
+async def connect_source(source_connector, net, source):
     net.ensure_connectable()
     readable, writable = net.pipe
     source.connect_source(source_connector.name, writable)
@@ -378,31 +399,31 @@ def connect_source(source_connector, net, source):
 
 
 @dispatch(SubprocessSinkConnector, SourceSuppliesFileIntNet, object)
-def connect_sink(sink_connector, net, sink):
+async def connect_sink(sink_connector, net, sink):
     # Make sure net.fp is available
-    net.ensure_source_connected()
+    await net.ensure_source_connected()
     sink.connect_sink(sink_connector.name, net.fp)
 
 
 @dispatch(SubprocessSinkConnector, SourceSuppliesFileIntNet, object)
-def connect_sink(sink_connector, net, sink):
+async def connect_sink(sink_connector, net, sink):
     # Make sure net.fp is available
-    net.ensure_source_connected()
-    sink.connect_sink(sink_connector.name, net.fl)
+    await net.ensure_source_connected()
+    sink.connect_sink(sink_connector.name, net.afl)
 
 
 @dispatch(FileSinkConnector, SinkSuppliesFileIntNet, object)
-def connect_sink(sink_connector, net, sink):
+async def connect_sink(sink_connector, net, sink):
     net.fp = sink.fp
 
 
 @dispatch(FileSinkConnector, SinkSuppliesFileLikeNet, object)
-def connect_sink(sink_connector, net, sink):
-    net.fl = sink.fl
+async def connect_sink(sink_connector, net, sink):
+    net.afl = sink.afl
 
 
 @dispatch(SubprocessSinkConnector, OSPipeNet, object)
-def connect_sink(sink_connector, net, sink):
+async def connect_sink(sink_connector, net, sink):
     net.ensure_connectable()
     readable, writable = net.pipe
     sink.connect_sink(sink_connector.name, readable)

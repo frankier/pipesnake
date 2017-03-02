@@ -50,7 +50,7 @@ class Net(object):
         for sink_name in self.sinks:
             self.rm_sink(sink_name)
 
-    def ensure_source_connected(self):
+    async def ensure_source_connected(self):
         from pipesnake.stages import connect_source
         self.ensure_connectable()
         if self.source is None:
@@ -59,9 +59,9 @@ class Net(object):
         connector = source_stage.source_connectors[source_name]
         if connector.is_connected:
             return
-        connect_source(connector, self, source_stage)
+        await connect_source(connector, self, source_stage)
 
-    def ensure_sinks_connected(self):
+    async def ensure_sinks_connected(self):
         from pipesnake.stages import connect_sink
         # XXX: Should throw exception here too maybe
         self.ensure_connectable()
@@ -69,7 +69,7 @@ class Net(object):
             connector = sink_stage.sink_connectors[sink_name]
             if connector.is_connected:
                 continue
-            connect_sink(connector, self, sink_stage)
+            await connect_sink(connector, self, sink_stage)
 
     def ensure_connectable(self):
         pass
@@ -112,21 +112,21 @@ class Stage(object):
         else:
             raise NoDefaultSinkException()
 
-    def ensure_sources_connected(self):
+    async def ensure_source_connected(self):
         from pipesnake.stages import connect_source
         for source_name, source_connector in self.source_connectors.items():
             if source_connector.is_connected:
                 continue
             self.sources[source_name].ensure_connectable()
-            connect_source(source_connector, self.sources[source_name], self)
+            await connect_source(source_connector, self.sources[source_name], self)
 
-    def ensure_sinks_connected(self):
+    async def ensure_sinks_connected(self):
         from pipesnake.stages import connect_sink
         for sink_name, sink_connector in self.sink_connectors.items():
             if sink_connector.is_connected:
                 continue
             self.sinks[sink_name].ensure_connectable()
-            connect_sink(sink_connector, self.sinks[sink_name], self)
+            await connect_sink(sink_connector, self.sinks[sink_name], self)
 
     # High level/chaining api XXX: Could remove or move to special DSL module
     def attach(self, sink_stage, source_name=None, sink_name=None,

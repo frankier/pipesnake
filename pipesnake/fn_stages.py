@@ -1,12 +1,13 @@
 import os
 from collections import namedtuple
 
+from curio import spawn
 from .graph import unsinked_iter, unsourced_iter
 from .run import run_pipeline_awaitables
 from .stages import (STDIN_SOURCE, STDOUT_SINK, OSPipeNet, PortStage,
                      SinkConnector, SinkSuppliesFileLikeNet, SourceConnector,
-                     SourceSuppliesFileLikeNet, dispatch, readable_fp_to_fl,
-                     sink_unsinked, source_unsourced, writable_fp_to_fl)
+                     SourceSuppliesFileLikeNet, dispatch, areadable_fp_to_fl,
+                     sink_unsinked, source_unsourced, awritable_fp_to_fl)
 
 
 def connect_input_output(root):
@@ -47,10 +48,10 @@ class LineProcFnStage(BaseFnStage):
     async def create_and_wait(self):
         input = self.sink_ports['input']
         output = self.source_ports['output']
-        for line in input:
+        async for line in input:
             out_line = self.fn(line)
-            output.write(out_line)
-        output.close()
+            await output.write(out_line)
+        await output.close()
 
 
 class CoRoProcFnStage(BaseFnStage):
@@ -62,13 +63,13 @@ class CoRoProcFnStage(BaseFnStage):
         input = self.sink_ports['input']
         output = self.source_ports['output']
         self.coro.send(None)
-        for line in input:
+        async for line in input:
             out_bit = self.coro.send(line)
             if out_bit:
-                output.write(out_bit)
+                await output.write(out_bit)
         for out_bit in self.coro:
-            output.write(out_bit)
-        output.close()
+            await output.write(out_bit)
+        await output.close()
 
 
 class WritableStage(PortStage):
@@ -137,20 +138,28 @@ class LineProcFnAugmentedStage(BaseFnStage):
 
     async def create_and_wait(self):
         # XXX: Possible problem - might deadlock if output buffer fills up
-        # since it is only drained at the end.
+        # since it is only drained at the task's end. Should continually drain
+        # buffer. (Spawn another coroutine to take care of this?)
+
         input = self.sink_ports['input']
         output = self.source_ports['output']
         stage = None
         self.augmentor.send(None)
+
+        async def finish_inner_task():
+            await writable.close()
+            await inner_stage_task.join()
+            r = await readable.read()
+            await output.write(r)
         try:
-            for line in input:
+            async for line in input:
                 if stage is None:
                     stage = self.mk_stage()
                     readable_stage, writable_stage =\
                         setup_pipe_fls_of_pipeline(stage)
-                    start_awaitable, finish_awaitable =\
-                        run_pipeline_awaitables(stage)
-                    await start_awaitable
+                    start_awaitable = run_pipeline_awaitables(stage)
+                    run_awaitable = await start_awaitable
+                    inner_stage_task = await spawn(run_awaitable)
                     readable = readable_stage.readable
                     writable = writable_stage.writable
                 commands = self.augmentor.send(line)
@@ -158,15 +167,13 @@ class LineProcFnAugmentedStage(BaseFnStage):
                     break
                 for command in commands:
                     if isinstance(command, self.ForwardString):
-                        writable.write(line)
+                        await writable.write(line)
                     elif isinstance(command, self.WriteString):
-                        writable.write(command.s)
+                        await writable.write(command.s)
                     elif isinstance(command, self.DirectWriteString):
-                        output.write(command.s)
+                        await output.write(command.s)
                     elif isinstance(command, self.RestartCommand):
-                        writable.close()
-                        output.write(readable.read())
-                        await finish_awaitable
+                        await finish_inner_task()
                         stage = None
                     elif isinstance(command, self.Finish):
                         return
@@ -174,33 +181,33 @@ class LineProcFnAugmentedStage(BaseFnStage):
                         raise  # Unknown command
         finally:
             if stage is not None:
-                writable.close()
-                await finish_awaitable
+                await finish_inner_task()
+            await output.close()
 
 
 # XXX: Identitcal to SubprocessSourceConnector, SinkSuppliesFileNet
 @dispatch(NeedsFileLikeSourceConnector, SinkSuppliesFileLikeNet, object)
-def connect_source(source_connector, net, source):
-    net.ensure_sinks_connected()
-    source.connect_source(source_connector.name, net.fl)
+async def connect_source(source_connector, net, source):
+    await net.ensure_sinks_connected()
+    source.connect_source(source_connector.name, net.afl)
 
 
 # XXX: Identitcal to SubprocessSinkConnector, SourceSuppliesFileNet
 @dispatch(NeedsFileLikeSinkConnector, SourceSuppliesFileLikeNet, object)
-def connect_sink(sink_connector, net, sink):
-    net.ensure_source_connected()
-    sink.connect_sink(sink_connector.name, net.fl)
+async def connect_sink(sink_connector, net, sink):
+    await net.ensure_source_connected()
+    sink.connect_sink(sink_connector.name, net.afl)
 
 
 @dispatch(NeedsFileLikeSourceConnector, OSPipeNet, object)
-def connect_source(source_connector, net, source):
+async def connect_source(source_connector, net, source):
     net.ensure_connectable()
     readable, writable = net.pipe
-    source.connect_source(source_connector.name, writable_fp_to_fl(writable))
+    source.connect_source(source_connector.name, awritable_fp_to_fl(writable))
 
 
 @dispatch(NeedsFileLikeSinkConnector, OSPipeNet, object)
-def connect_sink(sink_connector, net, sink):
+async def connect_sink(sink_connector, net, sink):
     net.ensure_connectable()
     readable, writable = net.pipe
-    sink.connect_sink(sink_connector.name, readable_fp_to_fl(readable))
+    sink.connect_sink(sink_connector.name, areadable_fp_to_fl(readable))
